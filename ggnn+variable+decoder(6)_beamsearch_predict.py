@@ -2,6 +2,8 @@ from typing import Tuple, List, Any, Sequence
 from sklearn.utils import shuffle
 import os
 
+from Hypothesis import Hypothesis
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import tensorflow as tf
 import numpy as np
@@ -95,6 +97,10 @@ def glorot_init(shape):
     initialization_range = np.sqrt(6.0 / (shape[-2] + shape[-1]))
     return np.random.uniform(low=-initialization_range, high=initialization_range, size=shape).astype(np.float32)
 
+# Beam Search中对Hypothesis对象的排序函数
+def sort_hyps(hyps):
+    """Return a list of Hypothesis objects, sorted by descending average log probability"""
+    return sorted(hyps, key=lambda h: h.avg_log_prob, reverse=True)
 
 class ProgModel(object):
 
@@ -980,53 +986,102 @@ class DenseGGNNProgModel(ProgModel):
             self.output = output
             return output
         else:
-            self.SOS_ID = tf.cast(2274,tf.int64)
-            self.EOS_ID = tf.cast(2275,tf.int64)
-            # 设置解码的最大步数。这是为了避免在极端情况出现无限循环的问题。
+            BEAM_SIZE = 10
+            SOS_ID = 2274
+            EOS_ID = 2275
             MAX_DEC_LEN = 60
-            with tf.variable_scope("decoder/rnn/multi_rnn_cell"):
-                # 使用一个变长的TensorArray来存储生成的句子。
-                init_array = tf.TensorArray(dtype=tf.int64, size=0,
-                                            dynamic_size=True, clear_after_read=False)
-                # 填入第一个单词<sos>作为解码器的输入。
-                init_array = init_array.write(0, self.SOS_ID)
-                # 构建初始的循环状态。循环状态包含循环神经网络的隐藏状态，保存生成句子的
-                # TensorArray，以及记录解码步数的一个整数step。
-                init_loop_var = (tuple([inte_vectors[:, :] for _ in range(NUM_LAYERS)]), init_array, 0)
-
-                # tf.while_loop的循环条件：
-                # 循环直到解码器输出<eos>，或者达到最大步数为止。
-                def continue_loop_condition(state, trg_ids, step):
-                    return tf.reduce_all(tf.logical_and(
-                        tf.not_equal(trg_ids.read(step), self.EOS_ID),
-                        tf.less(step, MAX_DEC_LEN - 1)))
-
-                def loop_body(state, trg_ids, step):
-                    # 读取最后一步输出的单词，并读取其词向量。
-                    trg_input = [trg_ids.read(step)]
+            MIN_DEC_LEN = 1
+            # 初始化beam_size数目的hyptheses
+            hyps = [Hypothesis(tokens=[SOS_ID],
+                               log_probs=[0.0],
+                               state=tuple([inte_vectors[:, :] for _ in range(NUM_LAYERS)])
+                               ) for _ in range(BEAM_SIZE)]
+            results = [] # 用来保存所有结果（包含EOS_ID的API序列）
+            steps = 0
+            while steps < MAX_DEC_LEN and len(results) < BEAM_SIZE:
+                all_hyps = []
+                for h in hyps:
                     trg_emb = tf.nn.embedding_lookup(self.weights['output2vector'],
-                                                     trg_input)
-                    # 这里不使用dynamic_rnn，而是直接调用dec_cell向前计算一步。
+                                                     [tf.cast(h.latest_token, tf.int64)])
                     dec_outputs, next_state = self.dec_cell.call(
-                        state=state, inputs=trg_emb)
-                    # 计算每个可能的输出单词对应的logit，并选取logit值最大的单词作为
-                    # 这一步的而输出。
+                                 state=h.state, inputs=trg_emb)
                     output = tf.reshape(dec_outputs, [-1, HIDDEN_SIZE])
                     logits = (tf.matmul(output, self.weights['softmax_weights'])
                               + self.weights['softmax_biases'])
-                    next_id = tf.argmax(logits, axis=1)
-                    # 将这一步输出的单词写入循环状态的trg_ids中。
-                    trg_ids = trg_ids.write(step + 1, next_id[0])
-                    #trg_ids = trg_ids.write(step + 1, 2274)
-                    return next_state, trg_ids, step + 1
+                    topk_probs, topk_ids = tf.nn.top_k(logits, BEAM_SIZE*2) # 在logits中获得概率排在前BEAM_SIZE*2的prob和id
+                    for id in range(topk_ids.get_shape()[1].value):
+                        new_hyp = h.extend(topk_ids[id], tf.log(topk_probs[id]), next_state)
+                        all_hyps.append(new_hyp)
+                # Filter and collect any hypotheses that have produced the end token.
+                hyps = []   # will contain hypotheses for the next step
+                for h in sort_hyps(all_hyps):   # in order of most likely h
+                    if h.latest_token == EOS_ID:    # if stop token is reached...
+                        # If this hypothesis is sufficiently long, put in results. Otherwise discard.
+                        if steps >= MIN_DEC_LEN:
+                            results.append(h)
+                    else:  # hasn't reached stop token, so continue to extend this hypothesis
+                        hyps.append(h)
+                    if len(hyps) == BEAM_SIZE or len(results) == BEAM_SIZE:
+                    # Once we've collected beam_size-many hypotheses for the next step, or beam_size-many complete hypotheses, stop.
+                        break
+            steps += 1
+            if len(results) == 0:  # if we don't have any complete results, add all current hypotheses (incomplete summaries) to results
+                results = hyps
+            # Sort hypotheses by average log probability
+            # 由log概率值从大到小排序后的Hypothesis对象列表
+            hyps_sorted = sort_hyps(results)
+            topAPIidSeqList = []
+            for hyp in hyps_sorted:
+                topAPIidSeqList.append(hyp.get_tokens)
+            return topAPIidSeqList
 
-                    # 执行tf.while_loop，返回最终状态。
-                state, trg_ids, step = tf.while_loop(
-                    continue_loop_condition, loop_body, init_loop_var)
 
-                self.output = trg_ids.stack()
-                return trg_ids.stack()
-
+            # self.SOS_ID = tf.cast(2274,tf.int64)
+            # self.EOS_ID = tf.cast(2275,tf.int64)
+            # # 设置解码的最大步数。这是为了避免在极端情况出现无限循环的问题。
+            # MAX_DEC_LEN = 60
+            # with tf.variable_scope("decoder/rnn/multi_rnn_cell"):
+            #     # 使用一个变长的TensorArray来存储生成的句子。
+            #     init_array = tf.TensorArray(dtype=tf.int64, size=0,
+            #                                 dynamic_size=True, clear_after_read=False)
+            #     # 填入第一个单词<sos>作为解码器的输入。
+            #     init_array = init_array.write(0, self.SOS_ID)
+            #     # 构建初始的循环状态。循环状态包含循环神经网络的隐藏状态，保存生成句子的
+            #     # TensorArray，以及记录解码步数的一个整数step。
+            #     init_loop_var = (tuple([inte_vectors[:, :] for _ in range(NUM_LAYERS)]), init_array, 0)
+            #
+            #     # tf.while_loop的循环条件：
+            #     # 循环直到解码器输出<eos>，或者达到最大步数为止。
+            #     def continue_loop_condition(state, trg_ids, step):
+            #         return tf.reduce_all(tf.logical_and(
+            #             tf.not_equal(trg_ids.read(step), self.EOS_ID),
+            #             tf.less(step, MAX_DEC_LEN - 1)))
+            #
+            #     def loop_body(state, trg_ids, step):
+            #         # 读取最后一步输出的单词，并读取其词向量。
+            #         trg_input = [trg_ids.read(step)]
+            #         trg_emb = tf.nn.embedding_lookup(self.weights['output2vector'],
+            #                                          trg_input)
+            #         # 这里不使用dynamic_rnn，而是直接调用dec_cell向前计算一步。
+            #         dec_outputs, next_state = self.dec_cell.call(
+            #             state=state, inputs=trg_emb)
+            #         # 计算每个可能的输出单词对应的logit，并选取logit值最大的单词作为
+            #         # 这一步的而输出。
+            #         output = tf.reshape(dec_outputs, [-1, HIDDEN_SIZE])
+            #         logits = (tf.matmul(output, self.weights['softmax_weights'])
+            #                   + self.weights['softmax_biases'])
+            #         next_id = tf.argmax(logits, axis=1)
+            #         # 将这一步输出的单词写入循环状态的trg_ids中。
+            #         trg_ids = trg_ids.write(step + 1, next_id[0])
+            #         #trg_ids = trg_ids.write(step + 1, 2274)
+            #         return next_state, trg_ids, step + 1
+            #
+            #         # 执行tf.while_loop，返回最终状态。
+            #     state, trg_ids, step = tf.while_loop(
+            #         continue_loop_condition, loop_body, init_loop_var)
+            #
+            #     self.output = trg_ids.stack()
+            #     return trg_ids.stack()
 
     # 数据预处理以及minibatch
     def process_raw_graphs(self, raw_data: Sequence[Any], is_training_data: bool, bucket_sizes=None) -> Any:
