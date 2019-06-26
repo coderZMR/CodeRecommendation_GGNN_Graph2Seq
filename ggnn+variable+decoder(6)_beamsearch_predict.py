@@ -18,6 +18,12 @@ from collections import namedtuple, defaultdict
 import gc
 import zerorpc
 
+BEAM_SIZE = 10
+SOS_ID = 2274
+EOS_ID = 2275
+MAX_DEC_LEN = 60
+MIN_DEC_LEN = 1
+
 # 因使用zerorpc进行RPC导致AttributeError: 'MultiRNNCell' object has no attribute '__name__'错误，现对MultiRNNCell进行封装，加入__name__属性
 class MultiRNNCell_with_name(tf.nn.rnn_cell.MultiRNNCell):
     def __init__(self, hidden_size, num_layers):
@@ -99,6 +105,9 @@ def glorot_init(shape):
 
 # Beam Search中对Hypothesis对象的排序函数
 def sort_hyps(hyps):
+    for h in hyps:
+        print("####### sort_hyps #######")
+        print(h.avg_log_prob)
     """Return a list of Hypothesis objects, sorted by descending average log probability"""
     return sorted(hyps, key=lambda h: h.avg_log_prob, reverse=True)
 
@@ -840,6 +849,9 @@ class DenseGGNNProgModel(ProgModel):
             cell = tf.contrib.rnn.GRUCell(h_dim)
             cell = tf.nn.rnn_cell.DropoutWrapper(cell, state_keep_prob=self.placeholders['graph_state_keep_prob'])
             self.weights['node_gru'] = cell
+        # Beam Search
+        self.dec_init_states = tf.placeholder(tf.float32, [None], name='dec_init_states')
+        self.latest_tokens = tf.placeholder(tf.int32, [None], name='latest_tokens')
 
     # 实现抽象方法
     # 这里定义了每次信息传递过程中需要的计算
@@ -986,54 +998,11 @@ class DenseGGNNProgModel(ProgModel):
             self.output = output
             return output
         else:
-            BEAM_SIZE = 10
-            SOS_ID = 2274
-            EOS_ID = 2275
-            MAX_DEC_LEN = 60
-            MIN_DEC_LEN = 1
-            # 初始化beam_size数目的hyptheses
-            hyps = [Hypothesis(tokens=[SOS_ID],
-                               log_probs=[0.0],
-                               state=tuple([inte_vectors[:, :] for _ in range(NUM_LAYERS)])
-                               ) for _ in range(BEAM_SIZE)]
-            results = [] # 用来保存所有结果（包含EOS_ID的API序列）
-            steps = 0
-            while steps < MAX_DEC_LEN and len(results) < BEAM_SIZE:
-                all_hyps = []
-                for h in hyps:
-                    trg_emb = tf.nn.embedding_lookup(self.weights['output2vector'],
-                                                     [tf.cast(h.latest_token, tf.int64)])
-                    dec_outputs, next_state = self.dec_cell.call(
-                                 state=h.state, inputs=trg_emb)
-                    output = tf.reshape(dec_outputs, [-1, HIDDEN_SIZE])
-                    logits = (tf.matmul(output, self.weights['softmax_weights'])
-                              + self.weights['softmax_biases'])
-                    topk_probs, topk_ids = tf.nn.top_k(logits, BEAM_SIZE*2) # 在logits中获得概率排在前BEAM_SIZE*2的prob和id
-                    for id in range(topk_ids.get_shape()[1].value):
-                        new_hyp = h.extend(topk_ids[id], tf.log(topk_probs[id]), next_state)
-                        all_hyps.append(new_hyp)
-                # Filter and collect any hypotheses that have produced the end token.
-                hyps = []   # will contain hypotheses for the next step
-                for h in sort_hyps(all_hyps):   # in order of most likely h
-                    if h.latest_token == EOS_ID:    # if stop token is reached...
-                        # If this hypothesis is sufficiently long, put in results. Otherwise discard.
-                        if steps >= MIN_DEC_LEN:
-                            results.append(h)
-                    else:  # hasn't reached stop token, so continue to extend this hypothesis
-                        hyps.append(h)
-                    if len(hyps) == BEAM_SIZE or len(results) == BEAM_SIZE:
-                    # Once we've collected beam_size-many hypotheses for the next step, or beam_size-many complete hypotheses, stop.
-                        break
-            steps += 1
-            if len(results) == 0:  # if we don't have any complete results, add all current hypotheses (incomplete summaries) to results
-                results = hyps
-            # Sort hypotheses by average log probability
-            # 由log概率值从大到小排序后的Hypothesis对象列表
-            hyps_sorted = sort_hyps(results)
-            topAPIidSeqList = []
-            for hyp in hyps_sorted:
-                topAPIidSeqList.append(hyp.get_tokens)
-            return topAPIidSeqList
+            self.output = inte_vectors
+            return inte_vectors
+
+
+
 
 
             # self.SOS_ID = tf.cast(2274,tf.int64)
@@ -1362,7 +1331,6 @@ class DenseGGNNProgModel(ProgModel):
                 temp.append(int(ele[1:]))
         return OneOrTwoDimList
 
-
     # inference操作
     def predict(self, graphRepresent, graphVocab, variableName, single_targets=[[-1]]):
         print("predicting")
@@ -1394,12 +1362,85 @@ class DenseGGNNProgModel(ProgModel):
                 break
             # print(batch)
             fetch_list = self.output
-            result = self.sess.run(fetch_list, feed_dict=batch)
-            length = len(result) - 1
-            for idx in range(length):
-                output_apiSeq += " " + (self.idx2api[result[idx + 1]])
-        return output_apiSeq
+            encoder_result = self.sess.run(fetch_list, feed_dict=batch)
+            # beam size
+            HIDDEN_SIZE = self.params['decoder_hidden_size']
 
+            # 初始化beam_size数目的hyptheses
+            hyps = [Hypothesis(tokens=[SOS_ID],
+                               log_probs=[0.0],
+                               state=tuple([encoder_result[:, :] for _ in range(self.params['decoder_num_layers'])])
+                               ) for _ in range(BEAM_SIZE)]
+            results = []  # 用来保存所有结果（包含EOS_ID的API序列）
+            steps = 0
+            while steps < MAX_DEC_LEN and len(results) < BEAM_SIZE:
+                latest_tokens = [h.latest_token for h in hyps]  # latest token produced by each hypothesis
+                states = [h.state for h in hyps]  # list of current decoder states of the hypotheses
+
+                # 执行一步解码
+                results = self.decodeOne(self.sess, latest_tokens, states)
+                all_hyps = []
+                for (topk_ids, topk_probs, next_state) in results:
+                    new_hyp = h.extend(topk_ids, tf.log(topk_probs), next_state)
+                    all_hyps.append(new_hyp)
+                # Filter and collect any hypotheses that have produced the end token.
+                hyps = []  # will contain hypotheses for the next step
+                for h in sort_hyps(all_hyps):  # in order of most likely h
+                    if h.latest_token == EOS_ID:  # if stop token is reached...
+                        # If this hypothesis is sufficiently long, put in results. Otherwise discard.
+                        if steps >= MIN_DEC_LEN:
+                            results.append(h)
+                    else:  # hasn't reached stop token, so continue to extend this hypothesis
+                        hyps.append(h)
+                    if len(hyps) == BEAM_SIZE or len(results) == BEAM_SIZE:
+                        # Once we've collected beam_size-many hypotheses for the next step, or beam_size-many complete hypotheses, stop.
+                        break
+                steps += 1
+            if len(
+                    results) == 0:  # if we don't have any complete results, add all current hypotheses (incomplete summaries) to results
+                results = hyps
+            # Sort hypotheses by average log probability
+            # 由log概率值从大到小排序后的Hypothesis对象列表
+            hyps_sorted = sort_hyps(results)
+            topAPIidSeqList = []
+            for hyp in hyps_sorted:
+                topAPIidSeqList.append(hyp.get_tokens)
+            print(topAPIidSeqList)
+            return topAPIidSeqList
+        #     length = len(result) - 1
+        #     for idx in range(length):
+        #         output_apiSeq += " " + (self.idx2api[result[idx + 1]])
+        # return output_apiSeq
+    def decodeOne(self, sess, latest_tokens, dec_init_states):
+        trg_emb = tf.nn.embedding_lookup(self.weights['output2vector'],
+                                        self.latest_tokens)
+        # tuple([self.dec_init_states[:, :] for _ in range(self.params['decoder_num_layers'])])
+        #dec_new = []
+        #for id in range(len(self.dec_init_states)):
+        #    dec_new.append(tuple([self.dec_init_states[id][:, :] for _ in range(self.params['decoder_num_layers'])]))
+
+
+        dec_outputs, next_state = self.dec_cell.call(
+            state=tuple(self.dec_init_states), inputs=trg_emb)
+        # tuple([inte_vectors[:, :] for _ in range(NUM_LAYERS)])\
+        output = tf.reshape(dec_outputs, [-1, self.params['decoder_hidden_size']])
+        logits = (tf.matmul(output, self.weights['softmax_weights'])
+                  + self.weights['softmax_biases'])
+        topk_probs, topk_ids = tf.nn.top_k(logits, BEAM_SIZE * 2)  # 在logits中获得概率排在前BEAM_SIZE*2的prob和id
+
+        feed = {
+            self.dec_init_states: dec_init_states,
+            self.latest_tokens: latest_tokens
+            #self.latest_tokens: np.transpose(np.array([latest_tokens]))
+        }
+        to_return = {
+            'topk_probs' : topk_probs,
+            'topk_ids' : topk_ids,
+            'next_state' : next_state
+        }
+
+        results = sess.run(to_return, feed_dict=feed)
+        return results
 
     def attention2(self, inputs, query, attention_size):
 
