@@ -13,6 +13,8 @@ graphVocab = "{1:'java.lang.String.getBytes()',2:'java.lang.String.Null',3:'if',
 variableName = "sign message digest algorithm pk byte mode encryption"
 ans = c.predict(graphRepresent,graphVocab,variableName)
 print('startrecord')
-print(ans)
+top10 = ans.split(';')
+for ele in top10:
+    print(ele)
 # for i in range(len(ans)):
 # 	print (ans[i])
